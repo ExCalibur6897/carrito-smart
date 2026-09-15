@@ -25,6 +25,16 @@ CREATE TABLE IF NOT EXISTS products (
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
 );
 
+CREATE TABLE IF NOT EXISTS rfid_tags (
+    uid TEXT PRIMARY KEY COLLATE NOCASE,
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_rfid_tags_product
+ON rfid_tags(product_id);
+
 CREATE TABLE IF NOT EXISTS sales (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -46,12 +56,19 @@ CREATE TABLE IF NOT EXISTS sale_items (
 
 
 SEED_PRODUCTS = (
-    ("CS-001", "Botella de agua", 1800, 20),
-    ("CS-002", "Refresco en lata", 2500, 15),
-    ("CS-003", "Bolsa de papas", 3200, 12),
-    ("CS-004", "Caja de cereal", 8950, 8),
-    ("CS-005", "Leche entera", 4200, 10),
-    ("CS-006", "Chocolate", 2750, 18),
+    ("CS-001", "Botella de agua", 1800, 100),
+    ("CS-002", "Refresco en lata", 2500, 100),
+    ("CS-003", "Bolsa de papas", 3200, 100),
+    ("CS-004", "Caja de cereal", 8950, 0),
+    ("CS-005", "Leche entera", 4200, 100),
+    ("CS-006", "Chocolate", 2750, 100),
+)
+
+# UIDs usados por el firmware y simulador del repositorio Arduino del equipo.
+SEED_RFID_TAGS = (
+    ("4A3B2C1D", "CS-002"),
+    ("8F9E0D1C", "CS-003"),
+    ("12345678", "CS-001"),
 )
 
 
@@ -89,6 +106,14 @@ class Database:
                 """,
                 SEED_PRODUCTS,
             )
+            for uid, sku in SEED_RFID_TAGS:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO rfid_tags (uid, product_id)
+                    SELECT ?, id FROM products WHERE sku = ?
+                    """,
+                    (uid, sku),
+                )
             connection.commit()
         LOGGER.info("Base de datos inicializada en %s", self.path)
 
@@ -111,6 +136,57 @@ class Database:
                 (product_id,),
             ).fetchone()
         return self._row_to_product(row) if row else None
+
+    def get_product_by_sku(self, sku: str) -> Product | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, sku, name, price_cents, stock, active
+                FROM products WHERE sku = ? AND active = 1
+                """,
+                (sku.strip(),),
+            ).fetchone()
+        return self._row_to_product(row) if row else None
+
+    def get_product_by_rfid_uid(self, uid: str) -> Product | None:
+        normalized_uid = uid.strip().upper()
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT p.id, p.sku, p.name, p.price_cents, p.stock, p.active
+                FROM rfid_tags AS tag
+                JOIN products AS p ON p.id = tag.product_id
+                WHERE tag.uid = ? AND tag.active = 1 AND p.active = 1
+                """,
+                (normalized_uid,),
+            ).fetchone()
+        return self._row_to_product(row) if row else None
+
+    def assign_rfid_tag(self, uid: str, product_id: int) -> None:
+        normalized_uid = uid.strip().upper()
+        with self.connect() as connection:
+            product = connection.execute(
+                "SELECT id FROM products WHERE id = ? AND active = 1",
+                (product_id,),
+            ).fetchone()
+            if product is None:
+                raise ValueError(f"Producto no disponible: {product_id}")
+            connection.execute(
+                """
+                INSERT INTO rfid_tags (uid, product_id, active)
+                VALUES (?, ?, 1)
+                ON CONFLICT(uid) DO UPDATE SET
+                    product_id = excluded.product_id,
+                    active = 1
+                """,
+                (normalized_uid, product_id),
+            )
+            connection.commit()
+        LOGGER.info(
+            "Etiqueta RFID asignada: uid=%s product_id=%s",
+            normalized_uid,
+            product_id,
+        )
 
     def complete_sale(self, items: Iterable[CartItem]) -> SaleReceipt:
         sale_items = list(items)
@@ -208,4 +284,3 @@ class Database:
             stock=int(row["stock"]),
             active=bool(row["active"]),
         )
-

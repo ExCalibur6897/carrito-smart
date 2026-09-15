@@ -15,11 +15,11 @@ from PySide6.QtCore import QObject, Signal, Slot
 from PySide6.QtGui import QImage
 
 from carrito_smart.config import AppConfig
+from carrito_smart.vision_crossing import TopCrossingTracker
 from carrito_smart.detection_stabilizer import (
     DetectionDecision,
     RawDetection,
     StableDetection,
-    TemporalDetectionStabilizer,
 )
 
 
@@ -164,6 +164,7 @@ class CameraWorker(QObject):
                 annotated = draw_stable_detections(
                     frame, self.stable_detections.latest()
                 )
+                draw_sensor_policy(annotated)
                 self.frame_ready.emit(frame_to_qimage(annotated))
 
                 metrics_elapsed = captured_at - metrics_started_at
@@ -191,6 +192,8 @@ class InferenceWorker(QObject):
     """Ejecuta YOLO con reloj propio y publica únicamente estado estabilizado."""
 
     detections_ready = Signal(list)
+    crossings_ready = Signal(list)
+    observation_ready = Signal(float)
     status_changed = Signal(str)
     metrics_ready = Signal(dict)
     failed = Signal(str)
@@ -207,6 +210,10 @@ class InferenceWorker(QObject):
         self.frames = frames
         self.stable_detections = stable_detections
         self._stop_event = threading.Event()
+        self._reset_crossings = threading.Event()
+
+    def reset_crossings(self) -> None:
+        self._reset_crossings.set()
 
     def request_stop(self) -> None:
         self._stop_event.set()
@@ -217,10 +224,19 @@ class InferenceWorker(QObject):
             yolo_config_dir = self.config.data_dir / "ultralytics"
             yolo_config_dir.mkdir(parents=True, exist_ok=True)
             os.environ.setdefault("YOLO_CONFIG_DIR", str(yolo_config_dir))
-            from ultralytics import YOLO
+            from ultralytics import YOLO, YOLOE
             import torch
 
-            model, model_name = self._load_model(YOLO)
+            model, model_name = self._load_model(YOLO, YOLOE)
+            detection_threshold, retention_threshold = (
+                self._thresholds_for_model(model_name)
+            )
+            class_thresholds = self._class_thresholds_for_model(model_name)
+            # El filtro del modelo no debe eliminar lecturas válidas de una clase.
+            prediction_threshold = min(
+                [retention_threshold]
+                + [retain for _, retain in class_thresholds.values()]
+            )
             device: str | int = 0 if torch.cuda.is_available() else "cpu"
             device_name = (
                 torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -230,21 +246,25 @@ class InferenceWorker(QObject):
             )
             LOGGER.info(
                 "Inferencia iniciada: model=%s device=%s target_fps=%.1f "
-                "imgsz=%s accept=%.2f retain=%.2f",
+                "imgsz=%s accept=%.2f retain=%.2f class_thresholds=%s predict_conf=%.2f",
                 model_name,
                 device_name,
                 self.config.inference_fps,
                 self.config.inference_image_size,
-                self.config.detection_threshold,
-                self.config.retention_threshold,
+                detection_threshold,
+                retention_threshold,
+                class_thresholds,
+                prediction_threshold,
             )
 
-            stabilizer = TemporalDetectionStabilizer(
-                detection_threshold=self.config.detection_threshold,
-                retention_threshold=self.config.retention_threshold,
+            stabilizer = TopCrossingTracker(
+                detection_threshold=detection_threshold,
+                retention_threshold=retention_threshold,
                 confirmation_count=self.config.confirmation_count,
                 detection_hold_ms=self.config.detection_hold_ms,
                 confidence_ema_alpha=self.config.confidence_ema_alpha,
+                class_thresholds=class_thresholds,
+                match_distance=self.config.crossing_match_distance,
             )
             inference_period = 1 / self.config.inference_fps
             ui_period = 1 / self.config.ui_update_fps
@@ -253,22 +273,28 @@ class InferenceWorker(QObject):
             metrics_started_at = time.monotonic()
             inference_count = 0
             latencies_ms: list[float] = []
+            last_sequence = -1
 
             while not self._stop_event.is_set():
                 delay = next_inference_at - time.monotonic()
                 if delay > 0 and self._stop_event.wait(delay):
                     break
                 snapshot = self.frames.latest()
-                if snapshot is None:
+                if snapshot is None or snapshot.sequence == last_sequence:
                     next_inference_at = time.monotonic() + 0.02
                     continue
+                last_sequence = snapshot.sequence
+                if self._reset_crossings.is_set():
+                    stabilizer.reset()
+                    self._reset_crossings.clear()
 
                 started_at = time.perf_counter()
                 result = model.predict(
                     source=snapshot.frame,
-                    conf=self.config.retention_threshold,
+                    conf=prediction_threshold,
                     imgsz=self.config.inference_image_size,
                     device=device,
+                    agnostic_nms=True,
                     verbose=False,
                 )[0]
                 finished_at = time.monotonic()
@@ -277,11 +303,17 @@ class InferenceWorker(QObject):
                 latencies_ms.append(latency_ms)
                 raw_detections = extract_detections(result)
                 self._log_raw_detections(raw_detections)
-                stable, decisions = stabilizer.update(
-                    raw_detections, now=finished_at
+                height, width = snapshot.frame.shape[:2]
+                stable, crossings, decisions = stabilizer.update(
+                    raw_detections, width=width, height=height, now=snapshot.captured_at,
                 )
                 self._log_decisions(decisions)
                 self.stable_detections.update(stable)
+                self.observation_ready.emit(snapshot.captured_at)
+                if crossings:
+                    for crossing in crossings:
+                        LOGGER.info("Evento visual de entrada: %s", crossing)
+                    self.crossings_ready.emit(crossings)
 
                 if finished_at - last_ui_emit_at >= ui_period:
                     self.detections_ready.emit(
@@ -315,24 +347,75 @@ class InferenceWorker(QObject):
             LOGGER.info("Inferencia detenida")
             self.finished.emit()
 
-    def _load_model(self, yolo_class: Any) -> tuple[Any, str]:
-        candidates = [self.config.yolo_model]
-        if self.config.fallback_yolo_model not in candidates:
-            candidates.append(self.config.fallback_yolo_model)
+    def _load_model(
+        self, yolo_class: Any, yoloe_class: Any
+    ) -> tuple[Any, str]:
+        candidates = list(
+            dict.fromkeys(
+                (
+                    self.config.yolo_model,
+                    self.config.fallback_yolo_model,
+                    self.config.secondary_fallback_yolo_model,
+                )
+            )
+        )
         last_error: Exception | None = None
         for model_name in candidates:
             try:
                 self.status_changed.emit(f"Cargando {model_name}…")
-                return yolo_class(model_name), model_name
+                if self._is_yoloe_model(model_name):
+                    model = yoloe_class(model_name)
+                    self.status_changed.emit("Preparando clases de productos…")
+                    prompts = list(self.config.yoloe_prompts)
+                    model.set_classes(prompts)
+                    LOGGER.info(
+                        "YOLOE configurado: model=%s prompts=%s",
+                        model_name,
+                        prompts,
+                    )
+                else:
+                    model = yolo_class(model_name)
+                return model, model_name
             except Exception as error:
                 last_error = error
                 LOGGER.exception("No se pudo cargar el modelo %s", model_name)
                 if model_name != candidates[-1]:
                     LOGGER.warning(
-                        "Intentando modelo fallback %s", candidates[-1]
+                        "Intentando modelo fallback %s",
+                        candidates[candidates.index(model_name) + 1],
                     )
         assert last_error is not None
         raise last_error
+
+    @staticmethod
+    def _is_yoloe_model(model_name: str) -> bool:
+        normalized = os.path.basename(model_name).casefold()
+        return normalized.startswith("yoloe-")
+
+    def _thresholds_for_model(self, model_name: str) -> tuple[float, float]:
+        """Usa umbrales calibrados para YOLOE sin alterar los fallbacks COCO."""
+        if self._is_yoloe_model(model_name):
+            return (
+                self.config.yoloe_detection_threshold,
+                self.config.yoloe_retention_threshold,
+            )
+        return (
+            self.config.detection_threshold,
+            self.config.retention_threshold,
+        )
+
+    def _class_thresholds_for_model(
+        self, model_name: str
+    ) -> dict[str, tuple[float, float]]:
+        """Ajuste de chocolate separado de botella, lata y fallbacks COCO."""
+        if not self._is_yoloe_model(model_name):
+            return {}
+        return {
+            self.config.yoloe_chocolate_bar_prompt.strip(): (
+                self.config.yoloe_chocolate_detection_threshold,
+                self.config.yoloe_chocolate_retention_threshold,
+            )
+        }
 
     @staticmethod
     def _log_raw_detections(detections: list[RawDetection]) -> None:
@@ -403,6 +486,12 @@ def draw_stable_detections(
             cv2.LINE_AA,
         )
     return canvas
+
+
+def draw_sensor_policy(canvas: Any) -> None:
+    """Texto sobre una copia, sin zonas de salida ni cambios a la entrada de YOLO."""
+    cv2.putText(canvas, "ENTRADA: aparicion + RFID | SALIDA: solo RFID",
+                (10, 22), cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 220, 50), 1, cv2.LINE_AA)
 
 
 def frame_to_qimage(frame: Any) -> QImage:

@@ -12,6 +12,8 @@ dependencies = [
     "PySide6>=6.8,<7",
     "opencv-python>=4.10,<5",
     "ultralytics>=8.3,<9",
+    "clip @ git+https://github.com/ultralytics/CLIP.git@a13192f8cb767260d7dfd98c843b0716593169e7",
+    "pyserial>=3.5,<4",
 ]
 
 [project.optional-dependencies]
@@ -26,4 +28,3 @@ include = ["carrito_smart*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-

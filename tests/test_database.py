@@ -9,6 +9,18 @@ from carrito_smart.database import Database, InventoryError
 from carrito_smart.models import CartItem
 
 
+def test_rfid_tag_can_be_reassigned_to_an_existing_product(tmp_path):
+    database = Database(tmp_path / "rfid.db")
+    database.initialize()
+    product = database.list_products()[0]
+
+    database.assign_rfid_tag("A1B2C3D4", product.id)
+
+    resolved = database.get_product_by_rfid_uid("a1b2c3d4")
+    assert resolved is not None
+    assert resolved.id == product.id
+
+
 @pytest.fixture()
 def database(tmp_path):
     database = Database(tmp_path / "test.db")
@@ -19,7 +31,15 @@ def database(tmp_path):
 def test_initial_products_are_seeded(database):
     products = database.list_products()
     assert len(products) == 6
-    assert all(product.stock > 0 for product in products)
+    stock_by_sku = {product.sku: product.stock for product in products}
+    assert stock_by_sku == {
+        "CS-001": 100,
+        "CS-002": 100,
+        "CS-003": 100,
+        "CS-004": 0,
+        "CS-005": 100,
+        "CS-006": 100,
+    }
 
 
 def test_inventory_is_only_discounted_after_checkout(database):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 
@@ -63,12 +64,17 @@ class TemporalDetectionStabilizer:
         confirmation_count: int,
         detection_hold_ms: int,
         confidence_ema_alpha: float,
+        class_thresholds: Mapping[str, tuple[float, float]] | None = None,
     ) -> None:
         self.detection_threshold = detection_threshold
         self.retention_threshold = retention_threshold
         self.confirmation_count = confirmation_count
         self.detection_hold_seconds = detection_hold_ms / 1000
         self.confidence_ema_alpha = confidence_ema_alpha
+        self.class_thresholds = dict(class_thresholds or {})
+        for accept, retain in self.class_thresholds.values():
+            if not 0 <= retain <= accept <= 1:
+                raise ValueError("Umbrales por clase: 0 <= retention <= detection <= 1")
         self._tracks: dict[str, _Track] = {}
 
     def update(
@@ -88,6 +94,7 @@ class TemporalDetectionStabilizer:
         accepted_classes: set[str] = set()
 
         for class_name, detection in best_by_class.items():
+            acceptance, retention = self._thresholds(class_name)
             track = self._tracks.get(class_name)
             if track is None:
                 self._start_candidate(detection, timestamp, decisions)
@@ -96,7 +103,7 @@ class TemporalDetectionStabilizer:
                 continue
 
             if track.confirmed:
-                if detection.confidence >= self.retention_threshold:
+                if detection.confidence >= retention:
                     track.smoothed_confidence = self._ema(
                         detection.confidence, track.smoothed_confidence
                     )
@@ -108,7 +115,7 @@ class TemporalDetectionStabilizer:
                         DetectionDecision(
                             class_name,
                             "maintained",
-                            "confianza sobre el umbral de retención",
+                            f"confianza sobre el umbral de retención ({retention:.2f})",
                             detection.confidence,
                             track.smoothed_confidence,
                         )
@@ -119,14 +126,15 @@ class TemporalDetectionStabilizer:
                         DetectionDecision(
                             class_name,
                             "held",
-                            "confianza bajo retención; se conserva dentro de tolerancia",
+                            f"confianza bajo retención ({retention:.2f}); "
+                            "se conserva dentro de tolerancia",
                             detection.confidence,
                             track.smoothed_confidence,
                         )
                     )
                 continue
 
-            if detection.confidence >= self.detection_threshold:
+            if detection.confidence >= acceptance:
                 track.consecutive_count += 1
                 track.smoothed_confidence = self._ema(
                     detection.confidence, track.smoothed_confidence
@@ -138,12 +146,15 @@ class TemporalDetectionStabilizer:
                     track.confirmed = True
                     track.held = False
                     decision = "confirmed"
-                    reason = f"{track.consecutive_count} detecciones consecutivas"
+                    reason = (
+                        f"{track.consecutive_count} detecciones consecutivas "
+                        f"sobre aceptación ({acceptance:.2f})"
+                    )
                 else:
                     decision = "candidate"
                     reason = (
                         f"confirmación {track.consecutive_count}/"
-                        f"{self.confirmation_count}"
+                        f"{self.confirmation_count}; aceptación={acceptance:.2f}"
                     )
                 decisions.append(
                     DetectionDecision(
@@ -160,7 +171,7 @@ class TemporalDetectionStabilizer:
                     DetectionDecision(
                         class_name,
                         "discarded",
-                        "candidato bajo el umbral de aceptación",
+                        f"candidato bajo el umbral de aceptación ({acceptance:.2f})",
                         detection.confidence,
                         track.smoothed_confidence,
                     )
@@ -225,12 +236,13 @@ class TemporalDetectionStabilizer:
         timestamp: float,
         decisions: list[DetectionDecision],
     ) -> None:
-        if detection.confidence < self.detection_threshold:
+        acceptance, _ = self._thresholds(detection.class_name)
+        if detection.confidence < acceptance:
             decisions.append(
                 DetectionDecision(
                     detection.class_name,
                     "discarded",
-                    "nueva detección bajo el umbral de aceptación",
+                    f"nueva detección bajo el umbral de aceptación ({acceptance:.2f})",
                     detection.confidence,
                     None,
                 )
@@ -250,13 +262,19 @@ class TemporalDetectionStabilizer:
                 detection.class_name,
                 "confirmed" if confirmed else "candidate",
                 (
-                    "confirmación inmediata"
+                    f"confirmación inmediata; aceptación={acceptance:.2f}"
                     if confirmed
-                    else f"confirmación 1/{self.confirmation_count}"
+                    else f"confirmación 1/{self.confirmation_count}; "
+                    f"aceptación={acceptance:.2f}"
                 ),
                 detection.confidence,
                 detection.confidence,
             )
+        )
+
+    def _thresholds(self, class_name: str) -> tuple[float, float]:
+        return self.class_thresholds.get(
+            class_name, (self.detection_threshold, self.retention_threshold)
         )
 
     def _ema(self, raw: float, previous: float) -> float:

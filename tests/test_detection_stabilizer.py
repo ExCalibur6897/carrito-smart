@@ -81,3 +81,66 @@ def test_interrupted_candidate_must_restart_confirmation():
 
     assert stable == []
     assert decisions[0].decision == "discarded"
+
+
+def make_chocolate_stabilizer() -> TemporalDetectionStabilizer:
+    return TemporalDetectionStabilizer(
+        detection_threshold=0.45, retention_threshold=0.25,
+        confirmation_count=3, detection_hold_ms=700, confidence_ema_alpha=0.30,
+        class_thresholds={"packet of chocolate": (0.30, 0.25)},
+    )
+
+
+def test_webcam_chocolate_sequence_confirms_without_lowering_other_thresholds():
+    stabilizer = make_chocolate_stabilizer()
+    # Lecturas del log real de webcam del 2026-09-09 a las 17:01:14–15.
+    confidences = [0.299, 0.330, 0.304, 0.301, 0.308, 0.304, 0.252]
+    for index, confidence in enumerate(confidences):
+        stable, decisions = stabilizer.update([
+            RawDetection("packet of chocolate", confidence, BOX),
+            RawDetection("aluminum soda can", confidence, BOX),
+            RawDetection("plastic water bottle", confidence, BOX),
+        ], now=index * 0.125)
+        assert [item.class_name for item in stable] == (
+            ["packet of chocolate"] if index >= 3 else []
+        )
+    assert not stable[0].held
+    assert decisions[0].decision == "maintained"
+    assert "0.25" in decisions[0].reason
+    assert "0.45" in decisions[1].reason
+
+
+def test_weak_chocolate_spike_does_not_confirm_and_missing_candidate_restarts():
+    stabilizer = make_chocolate_stabilizer()
+    for index, confidence in enumerate([0.29, 0.59, 0.28, 0.32, 0.34]):
+        assert stabilizer.update(
+            [RawDetection("packet of chocolate", confidence, BOX)], now=index * 0.125
+        )[0] == []
+    assert stabilizer.update([], now=0.625)[0] == []
+    assert stabilizer.update([RawDetection("packet of chocolate", 0.35, BOX)], now=0.75)[0] == []
+
+
+def test_chocolate_keeps_ema_box_and_hold_without_accepting_low_confidence():
+    stabilizer = make_chocolate_stabilizer()
+    for index, confidence in enumerate([0.33, 0.34, 0.35]):
+        stable, _ = stabilizer.update(
+            [RawDetection("packet of chocolate", confidence, BOX)], now=index * 0.125
+        )
+    assert stable[0].confidence == pytest.approx(0.3381)
+    held, _ = stabilizer.update(
+        [RawDetection("packet of chocolate", 0.24, (1, 2, 3, 4))], now=0.4
+    )
+    assert held[0].held
+    assert held[0].bbox == BOX
+    assert held[0].confidence == stable[0].confidence
+    assert stabilizer.update([], now=0.9)[0][0].held
+    assert stabilizer.update([], now=0.951)[0] == []
+
+
+def test_class_thresholds_reject_invalid_hysteresis():
+    with pytest.raises(ValueError, match="Umbrales por clase"):
+        TemporalDetectionStabilizer(
+            detection_threshold=0.45, retention_threshold=0.25,
+            confirmation_count=3, detection_hold_ms=700, confidence_ema_alpha=0.30,
+            class_thresholds={"chocolate": (0.2, 0.3)},
+        )

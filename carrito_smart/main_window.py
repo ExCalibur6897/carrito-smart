@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from PySide6.QtCore import Qt, QThread, QTimer, Slot
 from PySide6.QtGui import QCloseEvent, QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QCheckBox,
     QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QListWidget,
     QMainWindow,
     QMessageBox,
@@ -25,16 +28,24 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from carrito_smart.cart import CartError, CartService
+from carrito_smart.cart import CartService
 from carrito_smart.config import AppConfig
 from carrito_smart.database import Database, InventoryError, SaleValidationError
 from carrito_smart.models import format_money
+from carrito_smart.receipt_dialog import ReceiptDialog
+from carrito_smart.rfid import (
+    RfidEvent,
+    RfidProtocolError,
+    RfidSerialWorker,
+    parse_rfid_line,
+)
 from carrito_smart.vision import (
     CameraWorker,
     InferenceWorker,
     LatestFrameBuffer,
     StableDetectionBuffer,
 )
+from carrito_smart.sensor_fusion import SensorFusionCoordinator
 
 
 LOGGER = logging.getLogger(__name__)
@@ -46,11 +57,28 @@ class MainWindow(QMainWindow):
         self.database = database
         self.config = config
         self.cart = CartService(database)
+        self.fusion = SensorFusionCoordinator(
+            database,
+            self.cart,
+            {
+                "bottle": config.vision_bottle_sku,
+                config.yoloe_water_bottle_prompt: config.vision_bottle_sku,
+                config.yoloe_soda_can_prompt: config.vision_soda_can_sku,
+                config.yoloe_chocolate_bar_prompt: config.vision_chocolate_bar_sku,
+            },
+            window_ms=config.fusion_window_ms,
+        )
+        self._last_observation_at: float | None = None
+        self._serial_available = False
+        self._fusion_revision = -1
+        self._payment_open = False
         self._last_frame: QImage | None = None
         self._camera_thread: QThread | None = None
         self._camera_worker: CameraWorker | None = None
         self._inference_thread: QThread | None = None
         self._inference_worker: InferenceWorker | None = None
+        self._rfid_thread: QThread | None = None
+        self._rfid_worker: RfidSerialWorker | None = None
         self._vision_metrics: dict[str, object] = {}
 
         self.setWindowTitle("Carrito Smart · Prototipo")
@@ -60,7 +88,13 @@ class MainWindow(QMainWindow):
         self._apply_styles()
         self._load_products()
         self._refresh_cart()
+        self._fusion_timer = QTimer(self)
+        self._fusion_timer.setInterval(100)
+        self._fusion_timer.timeout.connect(self._poll_fusion)
+        self._fusion_timer.start()
+        self._simulation_changed()
         QTimer.singleShot(150, self._start_vision)
+        QTimer.singleShot(250, self._start_rfid)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -104,22 +138,45 @@ class MainWindow(QMainWindow):
         detections_layout.addWidget(self.detection_list)
         vision_panel.addWidget(detections_group)
 
+        self.vision_cart_status = QLabel(
+            "Entrada: aparición nueva + RFID · Salida: solo RFID"
+        )
+        self.vision_cart_status.setStyleSheet("color: #334155; font-size: 12px;")
+        self.vision_cart_status.setWordWrap(True)
+        vision_panel.addWidget(self.vision_cart_status)
+
         cart_panel = QVBoxLayout()
         cart_title = QLabel("Compra actual")
         cart_title.setObjectName("sectionTitle")
         cart_panel.addWidget(cart_title)
 
-        simulator = QGroupBox("Simulador RFID")
+        simulator = QGroupBox("Entrada: RFID + cámara · Salida: solo RFID")
         simulator_layout = QGridLayout(simulator)
         self.product_combo = QComboBox()
         self.product_combo.setMinimumWidth(320)
-        self.add_button = QPushButton("＋ Entrada")
+        self.add_button = QPushButton("Simular RFID entrada")
         self.add_button.setObjectName("primaryButton")
-        self.remove_button = QPushButton("− Salida")
+        self.remove_button = QPushButton("Simular RFID salida")
         simulator_layout.addWidget(QLabel("Producto"), 0, 0, 1, 2)
         simulator_layout.addWidget(self.product_combo, 1, 0, 1, 2)
         simulator_layout.addWidget(self.add_button, 2, 0)
         simulator_layout.addWidget(self.remove_button, 2, 1)
+        self.rfid_status = QLabel("Arduino: inicializando…")
+        self.rfid_status.setStyleSheet("color: #52667a; font-size: 12px;")
+        simulator_layout.addWidget(self.rfid_status, 3, 0, 1, 2)
+        simulator_layout.addWidget(QLabel("Probar trama sin Arduino"), 4, 0, 1, 2)
+        self.serial_line_input = QLineEdit("ENTRADA:4A3B2C1D")
+        self.serial_line_input.setPlaceholderText("ENTRADA:UID o SALIDA:UID")
+        self.serial_simulate_button = QPushButton("Procesar trama")
+        simulator_layout.addWidget(self.serial_line_input, 5, 0)
+        simulator_layout.addWidget(self.serial_simulate_button, 5, 1)
+        self.rfid_last_event = QLabel("Sin eventos RFID")
+        self.rfid_last_event.setWordWrap(True)
+        self.rfid_last_event.setStyleSheet("color: #334155; font-size: 12px;")
+        simulator_layout.addWidget(self.rfid_last_event, 6, 0, 1, 2)
+        self.rfid_simulation = QCheckBox("Modo de prueba sin Arduino (webcam para entradas)")
+        self.rfid_simulation.setChecked(not self.config.rfid_enabled)
+        simulator_layout.addWidget(self.rfid_simulation, 7, 0, 1, 2)
         cart_panel.addWidget(simulator)
 
         self.cart_table = QTableWidget(0, 4)
@@ -151,7 +208,7 @@ class MainWindow(QMainWindow):
         cart_panel.addWidget(total_frame)
 
         actions = QHBoxLayout()
-        self.clear_button = QPushButton("Vaciar")
+        self.clear_button = QPushButton("Cancelar compra")
         self.pay_button = QPushButton("Simular pago aprobado")
         self.pay_button.setObjectName("payButton")
         actions.addWidget(self.clear_button)
@@ -168,9 +225,12 @@ class MainWindow(QMainWindow):
 
         self.add_button.clicked.connect(self._simulate_entry)
         self.remove_button.clicked.connect(self._simulate_exit)
+        self.serial_simulate_button.clicked.connect(self._simulate_serial_line)
+        self.serial_line_input.returnPressed.connect(self._simulate_serial_line)
         self.clear_button.clicked.connect(self._clear_cart)
         self.pay_button.clicked.connect(self._pay)
         self.cart_table.itemSelectionChanged.connect(self._sync_combo_to_selection)
+        self.rfid_simulation.toggled.connect(self._simulation_changed)
         self.statusBar().showMessage("Listo")
 
     def _apply_styles(self) -> None:
@@ -190,6 +250,7 @@ class MainWindow(QMainWindow):
             QPushButton#payButton { background: #16a34a; color: white; font-size: 15px; }
             QPushButton#payButton:hover { background: #15803d; }
             QPushButton:disabled { background: #cbd5e1; color: #64748b; }
+            QPushButton#payButton:disabled, QPushButton#primaryButton:disabled { background: #cbd5e1; color: #64748b; }
             QFrame#totalFrame { background: #102a43; border-radius: 8px; }
             QFrame#totalFrame QLabel { background: transparent; color: white; font-weight: 700; }
             QLabel#totalLabel { font-size: 25px; }
@@ -230,69 +291,94 @@ class MainWindow(QMainWindow):
                 self.cart_table.setItem(row, column, cell)
         total = self.cart.total_cents
         self.total_label.setText(format_money(total))
-        self.pay_button.setEnabled(bool(items))
-        self.clear_button.setEnabled(bool(items))
+        self.pay_button.setEnabled(bool(items) and not self.fusion.blocked and not self._payment_open)
+        self.clear_button.setEnabled(bool(items or self.fusion.pending or self.fusion.issues or self.fusion.visual_notices) and not self._payment_open)
 
     @Slot()
     def _simulate_entry(self) -> None:
-        product_id = self.product_combo.currentData()
-        if product_id is None:
-            return
-        try:
-            self.cart.add_product(int(product_id))
-        except CartError as error:
-            QMessageBox.warning(self, "Entrada rechazada", str(error))
-            return
-        self._refresh_cart()
-        self.statusBar().showMessage("Entrada RFID simulada", 3000)
+        self._simulate_product_rfid("ENTRADA")
 
     @Slot()
     def _simulate_exit(self) -> None:
+        self._simulate_product_rfid("SALIDA")
+
+    def _simulate_product_rfid(self, action: str) -> None:
+        if not self.rfid_simulation.isChecked():
+            return
         product_id = self._selected_cart_product_id()
-        if product_id is None:
+        if product_id is None or action == "ENTRADA":
             product_id = self.product_combo.currentData()
         if product_id is None:
             return
-        try:
-            self.cart.remove_product(int(product_id))
-        except CartError as error:
-            QMessageBox.information(self, "Salida simulada", str(error))
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT uid FROM rfid_tags WHERE product_id=? AND active=1 ORDER BY uid",
+                (int(product_id),),
+            ).fetchall()
+        candidates = [row["uid"] for row in rows if
+                      (row["uid"] in self.fusion.present_uids) == (action == "SALIDA")]
+        if len(candidates) != 1:
+            self.statusBar().showMessage("Indique el UID exacto en Probar trama; no se elige entre varias etiquetas", 6000)
             return
-        self._refresh_cart()
-        self.statusBar().showMessage("Salida RFID simulada", 3000)
+        self.serial_line_input.setText(f"{action}:{candidates[0]}")
+        self._simulate_serial_line()
 
     @Slot()
     def _clear_cart(self) -> None:
+        if self._payment_open:
+            return
+        answer = QMessageBox.question(
+            self, "Cancelar compra", "¿Cancelar toda la compra y sus pendientes? "
+            "Vacíe físicamente el carrito antes de iniciar otra compra.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
         self.cart.clear()
-        self._refresh_cart()
-        self.statusBar().showMessage("Carrito vaciado", 3000)
+        self._reset_purchase()
+
+    def _reset_purchase(self) -> None:
+        self.fusion.reset()
+        if self._inference_worker is not None:
+            self._inference_worker.reset_crossings()
+        self._refresh_fusion()
 
     @Slot()
     def _pay(self) -> None:
+        if self._payment_open:
+            return
+        self._poll_fusion()
+        if self.fusion.blocked or not self.cart.items:
+            self.statusBar().showMessage("Pago bloqueado: resuelva la validación RFID + webcam", 5000)
+            return
         total = self.cart.total_cents
+        purchased_items = self.cart.items
+        revision = self.fusion.payment_revision
+        self._payment_open = True
+        self._refresh_cart()
         answer = QMessageBox.question(
             self,
             "Confirmar pago simulado",
             f"¿Aprobar el pago por {format_money(total)}?\n\n"
             "Al confirmar se registrará la venta y se descontará el inventario.",
         )
+        self._payment_open = False
+        self._poll_fusion()
+        self._refresh_cart()
         if answer != QMessageBox.StandardButton.Yes:
             LOGGER.info("Pago simulado cancelado por el usuario")
+            return
+        if self.fusion.blocked or self.fusion.payment_revision != revision or self.cart.items != purchased_items:
+            self.statusBar().showMessage("La compra cambió durante la confirmación; revise y confirme de nuevo", 6000)
             return
         try:
             receipt = self.cart.checkout()
         except (InventoryError, SaleValidationError) as error:
             QMessageBox.critical(self, "Pago rechazado", str(error))
             return
-        self._refresh_cart()
+        self._reset_purchase()
         self._load_products()
-        QMessageBox.information(
-            self,
-            "Pago aprobado",
-            f"Venta #{receipt.sale_id} registrada correctamente.\n"
-            f"Total: {format_money(receipt.total_cents)}",
-        )
         self.statusBar().showMessage(f"Venta #{receipt.sale_id} aprobada", 5000)
+        ReceiptDialog(receipt, purchased_items, self).exec()
 
     def _selected_cart_product_id(self) -> int | None:
         row = self.cart_table.currentRow()
@@ -335,6 +421,8 @@ class MainWindow(QMainWindow):
         self._inference_worker.moveToThread(self._inference_thread)
         self._inference_thread.started.connect(self._inference_worker.run)
         self._inference_worker.detections_ready.connect(self._show_detections)
+        self._inference_worker.crossings_ready.connect(self._handle_visual_crossings)
+        self._inference_worker.observation_ready.connect(self._vision_observation)
         self._inference_worker.status_changed.connect(self._show_vision_status)
         self._inference_worker.metrics_ready.connect(self._show_vision_metrics)
         self._inference_worker.failed.connect(self._show_inference_error)
@@ -344,6 +432,116 @@ class MainWindow(QMainWindow):
 
         self._inference_thread.start()
         self._camera_thread.start()
+
+    def _start_rfid(self) -> None:
+        if not self.config.rfid_enabled:
+            self.rfid_status.setText("Arduino deshabilitado · use el modo de prueba para simular RFID")
+            return
+        self._rfid_thread = QThread(self)
+        self._rfid_worker = RfidSerialWorker(
+            self.config.rfid_port,
+            self.config.rfid_baud_rate,
+            self.config.rfid_reconnect_ms,
+        )
+        self._rfid_worker.moveToThread(self._rfid_thread)
+        self._rfid_thread.started.connect(self._rfid_worker.run)
+        self._rfid_worker.event_received.connect(self._handle_rfid_event)
+        self._rfid_worker.availability_changed.connect(self._rfid_availability)
+        self._rfid_worker.status_changed.connect(self._show_rfid_status)
+        self._rfid_worker.failed.connect(self._show_rfid_error)
+        self._rfid_worker.finished.connect(
+            self._rfid_thread.quit, Qt.ConnectionType.DirectConnection
+        )
+        self._rfid_thread.start()
+
+    @Slot()
+    def _simulate_serial_line(self) -> None:
+        if not self.rfid_simulation.isChecked():
+            return
+        self._poll_fusion()
+        line = self.serial_line_input.text()
+        try:
+            event = parse_rfid_line(line)
+        except RfidProtocolError as error:
+            QMessageBox.warning(self, "Trama RFID inválida", str(error))
+            return
+        if event is None:
+            QMessageBox.warning(
+                self,
+                "Trama RFID inválida",
+                "Use el formato ENTRADA:UID o SALIDA:UID",
+            )
+            return
+        LOGGER.info("Trama RFID inyectada desde simulador: %s", event.raw_line)
+        self.fusion.on_rfid(event)
+        self.rfid_last_event.setText(self.fusion.message)
+        self._refresh_fusion()
+
+    @Slot(object)
+    def _handle_rfid_event(self, event: RfidEvent) -> None:
+        if self.rfid_simulation.isChecked():
+            return
+        self._poll_fusion()
+        self.fusion.on_rfid(event)
+        self.rfid_last_event.setText(f"{event.uid} · {self.fusion.message}")
+        self._refresh_fusion()
+
+    @Slot()
+    def _simulation_changed(self) -> None:
+        simulated = self.rfid_simulation.isChecked()
+        self.fusion.invalidate("Cambio de modo RFID; repetir pendientes")
+        self.fusion.set_available("rfid", simulated or self._serial_available)
+        for widget in (self.add_button, self.remove_button, self.serial_line_input, self.serial_simulate_button):
+            widget.setEnabled(simulated)
+        if self._inference_worker is not None:
+            self._inference_worker.reset_crossings()
+        self._refresh_fusion()
+
+    @Slot(bool)
+    def _rfid_availability(self, available: bool) -> None:
+        self._serial_available = available
+        self.fusion.set_available("rfid", self.rfid_simulation.isChecked() or available)
+        if not available and not self.rfid_simulation.isChecked() and self._inference_worker is not None:
+            self._inference_worker.reset_crossings()
+        self._refresh_fusion()
+
+    @Slot(float)
+    def _vision_observation(self, captured_at: float) -> None:
+        self._last_observation_at = captured_at
+        fresh = time.monotonic() - captured_at <= self.config.vision_stale_ms / 1000
+        self.fusion.set_available("vision", fresh and self.config.vision_auto_cart_enabled)
+        self._refresh_fusion()
+
+    @Slot(list)
+    def _handle_visual_crossings(self, events: list) -> None:
+        self.fusion.on_visual_batch(events)
+        self._refresh_fusion()
+
+    @Slot()
+    def _poll_fusion(self) -> None:
+        if self._last_observation_at is not None and time.monotonic() - self._last_observation_at > self.config.vision_stale_ms / 1000:
+            if self.fusion.available["vision"] and self._inference_worker is not None:
+                self._inference_worker.reset_crossings()
+            self.fusion.set_available("vision", False)
+        self.fusion.tick()
+        self._refresh_fusion()
+
+    def _refresh_fusion(self) -> None:
+        if self._fusion_revision == self.fusion.revision:
+            return
+        self._fusion_revision = self.fusion.revision
+        self.vision_cart_status.setText(self.fusion.status)
+        self._refresh_cart()
+
+    @Slot(str)
+    def _show_rfid_status(self, message: str) -> None:
+        self.rfid_status.setText(message)
+
+    @Slot(str)
+    def _show_rfid_error(self, message: str) -> None:
+        self._rfid_availability(False)
+        LOGGER.error("RFID no disponible: %s", message)
+        self.rfid_status.setText(f"Arduino no disponible · {message}")
 
     @Slot(QImage)
     def _show_frame(self, image: QImage) -> None:
@@ -388,16 +586,20 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _show_camera_error(self, message: str) -> None:
+        self.fusion.set_available("vision", False)
+        self._refresh_fusion()
         self.vision_status.setText("Visión no disponible")
         self.video_label.setText(f"No se pudo iniciar la visión\n\n{message}")
-        self.statusBar().showMessage("La compra manual sigue disponible")
+        self.statusBar().showMessage("Sin cámara: entradas y pago pausados; salidas por RFID disponibles si el lector está conectado")
         if self._inference_worker is not None:
             self._inference_worker.request_stop()
 
     @Slot(str)
     def _show_inference_error(self, message: str) -> None:
+        self.fusion.set_available("vision", False)
+        self._refresh_fusion()
         self.vision_status.setText("YOLO no disponible; webcam activa")
-        self.statusBar().showMessage(f"Error de inferencia: {message}")
+        self.statusBar().showMessage(f"Error de inferencia: {message} · Entradas y pago pausados; salidas solo RFID")
 
     @Slot(dict)
     def _show_vision_metrics(self, metrics: dict[str, object]) -> None:
@@ -415,12 +617,18 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        for worker in (self._camera_worker, self._inference_worker):
+        self._fusion_timer.stop()
+        for worker in (
+            self._camera_worker,
+            self._inference_worker,
+            self._rfid_worker,
+        ):
             if worker is not None:
                 worker.request_stop()
         for name, thread in (
             ("captura", self._camera_thread),
             ("inferencia", self._inference_thread),
+            ("RFID", self._rfid_thread),
         ):
             if thread is not None and thread.isRunning() and not thread.wait(7000):
                 LOGGER.warning("El hilo de %s no respondió a tiempo al cierre", name)

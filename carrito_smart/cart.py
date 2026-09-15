@@ -33,7 +33,7 @@ class CartService:
     def total_cents(self) -> int:
         return sum(item.subtotal_cents for item in self.items)
 
-    def add_product(self, product_id: int) -> None:
+    def add_product(self, product_id: int, *, source: str = "manual") -> None:
         product = self.database.get_product(product_id)
         if product is None or not product.active:
             raise CartError("Producto no disponible")
@@ -42,13 +42,14 @@ class CartService:
             raise CartError(f"No hay más unidades disponibles de {product.name}")
         self._quantities[product_id] = new_quantity
         LOGGER.info(
-            "Entrada simulada: product_id=%s producto=%s cantidad=%s",
+            "Entrada carrito: source=%s product_id=%s producto=%s cantidad=%s",
+            source,
             product_id,
             product.name,
             new_quantity,
         )
 
-    def remove_product(self, product_id: int) -> None:
+    def remove_product(self, product_id: int, *, source: str = "manual") -> None:
         current = self._quantities.get(product_id, 0)
         if current <= 0:
             raise CartError("El producto no está en el carrito")
@@ -57,7 +58,8 @@ class CartService:
         else:
             self._quantities[product_id] = current - 1
         LOGGER.info(
-            "Salida simulada: product_id=%s cantidad=%s",
+            "Salida carrito: source=%s product_id=%s cantidad=%s",
+            source,
             product_id,
             max(0, current - 1),
         )
